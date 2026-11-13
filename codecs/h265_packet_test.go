@@ -5,6 +5,7 @@ package codecs
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"slices"
 	"testing"
@@ -1393,4 +1394,308 @@ func TestH265Depacketizer_Roundtrip(t *testing.T) {
 
 func uint16ptr(v uint16) *uint16 {
 	return &v
+}
+
+// h265DONLTestStream is the fixed NAL unit sequence used by the H265AddDONL tests.
+// It covers a parameter set burst followed by a VCL NAL unit, a NAL unit that
+// fits in a single packet, and a NAL unit large enough to be fragmented.
+func h265DONLTestStream() [][]byte {
+	bigPayload := make([]byte, 90)
+	for i := range bigPayload {
+		bigPayload[i] = uint8(i)
+	}
+
+	return [][]byte{
+		createTestH265NALU(h265NaluVpsType, []byte{0x0c, 0x01}),
+		createTestH265NALU(h265NaluSpsType, createTestH265SpsPayload()),
+		createTestH265NALU(h265NaluPpsType, createTestH265ExpGolombPayload(0, 0)),
+		createTestH265NALU(19, []byte{0x01, 0x02, 0x03}),
+		createTestH265NALU(1, bigPayload),
+	}
+}
+
+// TestH265Payloader_AddDONL_Output pins the exact wire format of every packet
+// H265Payloader produces with AddDONL enabled: a DONL field for single NAL unit
+// packets, a DONL plus DOND fields for aggregation packets, and a DONL only in
+// the first fragmentation unit.
+func TestH265Payloader_AddDONL_Output(t *testing.T) {
+	stream := createTestH265AnnexB(h265DONLTestStream()...)
+
+	for _, tc := range []struct {
+		name            string
+		mtu             uint16
+		skipAggregation bool
+		expected        []string
+	}{
+		{
+			name:            "single NAL unit packets",
+			mtu:             300,
+			skipAggregation: true,
+			expected: []string{
+				// PayloadHdr, then the DONL of the NAL unit
+				"400100000c01",
+				"420100010000000000000000000000000080",
+				"4401000280",
+				"26010003010203",
+				// Equivalent to a single packet: FU header, then the DONL
+				"02010004000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50515253545556575859",
+			},
+		},
+		{
+			name: "aggregation packet",
+			mtu:  300,
+			expected: []string{
+				// PayloadHdr type 48, DONL of the first aggregation unit,
+				// then for each unit: NALU size and NAL unit, preceded by a DOND
+				// for all units but the first
+				"60010000" +
+					"0004" + "40010c01" +
+					"00" + "0010" + "42010000000000000000000000000080" +
+					"00" + "0003" + "440180" +
+					"00" + "0005" + "2601010203" +
+					"00" + "005c" + "0201000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50515253545556575859",
+			},
+		},
+		{
+			name: "fragments",
+			mtu:  48,
+			expected: []string{
+				"60010000000440010c01000010420100000000000000000000000000800000034401800000052601010203",
+				// S bit set, so the DONL is present
+				"6201810004000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a",
+				// S bit clear, so no DONL
+				"6201012b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455",
+				"62014156575859",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payloader := H265Payloader{AddDONL: true, SkipAggregation: tc.skipAggregation}
+			assert.Equal(t, decodeTestH265Payloads(t, tc.expected), payloader.Payload(tc.mtu, stream))
+		})
+	}
+}
+
+// TestH265Payloader_AddDONLDisabled_Output pins the exact wire format of every
+// packet H265Payloader produces with AddDONL disabled, so that turning the
+// feature off keeps the output byte-for-byte identical.
+func TestH265Payloader_AddDONLDisabled_Output(t *testing.T) {
+	stream := createTestH265AnnexB(h265DONLTestStream()...)
+
+	for _, tc := range []struct {
+		name            string
+		mtu             uint16
+		skipAggregation bool
+		expected        []string
+	}{
+		{
+			name:            "single NAL unit packets",
+			mtu:             300,
+			skipAggregation: true,
+			expected: []string{
+				"40010c01",
+				"42010000000000000000000000000080",
+				"440180",
+				"2601010203",
+				"0201000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50515253545556575859",
+			},
+		},
+		{
+			name: "aggregation packet",
+			mtu:  300,
+			expected: []string{
+				"6001000440010c01001042010000000000000000000000000080000344018000052601010203005c0201000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50515253545556575859",
+			},
+		},
+		{
+			name: "fragments",
+			mtu:  48,
+			expected: []string{
+				"6001000440010c01001042010000000000000000000000000080000344018000052601010203",
+				"620181000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c",
+				"6201412d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50515253545556575859",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payloader := H265Payloader{SkipAggregation: tc.skipAggregation}
+			assert.Equal(t, decodeTestH265Payloads(t, tc.expected), payloader.Payload(tc.mtu, stream))
+		})
+	}
+}
+
+// decodeTestH265Payloads decodes the hex encoded RTP payloads of a test case.
+func decodeTestH265Payloads(t *testing.T, encoded []string) [][]byte {
+	t.Helper()
+
+	payloads := make([][]byte, 0, len(encoded))
+	for _, packet := range encoded {
+		payload, err := hex.DecodeString(packet)
+		if !assert.NoError(t, err) {
+			return nil
+		}
+		payloads = append(payloads, payload)
+	}
+
+	return payloads
+}
+
+// TestH265Payloader_AddDONLNumbersCachedParameterSets checks that parameter sets
+// taken from the cache get the decoding order number of the packet that actually
+// carries them, not the one they had when they were received.
+func TestH265Payloader_AddDONLNumbersCachedParameterSets(t *testing.T) {
+	nalus := h265DONLTestStream()
+	vps, sps, pps := nalus[0], nalus[1], nalus[2]
+	vcl0, vcl1 := nalus[3], nalus[4]
+
+	payloader := H265Payloader{AddDONL: true}
+
+	assert.Empty(t, payloader.Payload(1500, createTestH265AnnexB(vps, sps)))
+
+	// The VPS and SPS are sent now, so they are numbered 0 and 1 even though
+	// they were received before the PPS, which is only sent with this NAL unit.
+	first := payloader.Payload(1500, createTestH265AnnexB(pps, vcl0))
+	if !assert.Len(t, first, 1) {
+		return
+	}
+	units := parseTestH265AggregationUnits(t, first[0])
+	if !assert.Len(t, units, 4) {
+		return
+	}
+	for i, unit := range units {
+		if !assert.NotNil(t, unit.donl, "unit %d should carry a DONL", i) {
+			return
+		}
+		assert.Equal(t, uint16(i), *unit.donl, "unit %d", i) //nolint:gosec // test data
+	}
+
+	// The SPS cached earlier is re-sent with the next NAL unit, after the ones above.
+	second := payloader.Payload(1500, createTestH265AnnexB(vcl1))
+	if !assert.Len(t, second, 1) {
+		return
+	}
+	assert.Equal(t, uint16(4), *parseTestH265SinglePacket(t, second[0]).donl)
+
+	// An empty payload must not consume a decoding order number.
+	assert.Empty(t, payloader.Payload(1500, nil))
+	third := payloader.Payload(1500, createTestH265AnnexB(vcl0))
+	if !assert.Len(t, third, 1) {
+		return
+	}
+	assert.Equal(t, uint16(5), *parseTestH265SinglePacket(t, third[0]).donl)
+}
+
+// parseTestH265AggregationUnits parses an aggregation packet that carries DONL fields.
+func parseTestH265AggregationUnits(t *testing.T, payload []byte) []h265SingleNALUnitPacket {
+	t.Helper()
+
+	aggregation, err := parseH265AggregationPacket(payload, true)
+	if !assert.NoError(t, err) {
+		return nil
+	}
+	units, err := splitH265AggregationPacket(*aggregation)
+	if !assert.NoError(t, err) {
+		return nil
+	}
+
+	return units
+}
+
+// parseTestH265SinglePacket parses a single NAL unit packet that carries a DONL field.
+func parseTestH265SinglePacket(t *testing.T, payload []byte) *h265SingleNALUnitPacket {
+	t.Helper()
+
+	single, err := parseH265SingleNalUnitPacket(payload, true)
+	if !assert.NoError(t, err) {
+		return nil
+	}
+
+	return single
+}
+
+// TestH265Payloader_AddDONLWraparound checks that the 16-bit DON counter wraps
+// around and that the wrapped values still produce valid aggregation packets.
+func TestH265Payloader_AddDONLWraparound(t *testing.T) {
+	payloader := H265Payloader{AddDONL: true}
+	payloader.donl = 65534
+
+	payloads := payloader.Payload(1500, createTestH265AnnexB(
+		createTestH265NALU(19, []byte{0xaa}),
+		createTestH265NALU(19, []byte{0xbb}),
+		createTestH265NALU(19, []byte{0xcc}),
+		createTestH265NALU(19, []byte{0xdd}),
+	))
+	if !assert.Len(t, payloads, 1) {
+		return
+	}
+	assert.Equal(t, uint16(2), payloader.donl, "the counter should have wrapped")
+
+	units := parseTestH265AggregationUnits(t, payloads[0])
+	if !assert.Len(t, units, 4) {
+		return
+	}
+
+	expected := []uint16{65534, 65535, 0, 1}
+	for i, unit := range units {
+		if !assert.NotNil(t, unit.donl, "unit %d should carry a DONL", i) {
+			return
+		}
+		assert.Equal(t, expected[i], *unit.donl, "unit %d", i)
+	}
+}
+
+// TestH265Payloader_AddDONLRoundtrip checks that a stream packetized with
+// AddDONL enabled can be depacketized with DONL parsing enabled, and that the
+// NAL units come back in the order they were sent.
+func TestH265Payloader_AddDONLRoundtrip(t *testing.T) {
+	nalus := h265DONLTestStream()
+	stream := createTestH265AnnexB(nalus...)
+
+	for _, tc := range []struct {
+		name            string
+		mtu             uint16
+		skipAggregation bool
+	}{
+		{name: "aggregation", mtu: 1500},
+		{name: "small mtu forces fragmentation", mtu: 48},
+		{name: "skip aggregation", mtu: 300, skipAggregation: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payloader := H265Payloader{AddDONL: true, SkipAggregation: tc.skipAggregation}
+			depacketizer := H265Packet{}
+			depacketizer.WithDONL(true)
+
+			// The payloader only drops AUDs and filler data, and the test stream
+			// has neither, so the whole stream must come back in send order.
+			output := make([]byte, 0)
+			for _, payload := range payloader.Payload(tc.mtu, stream) {
+				annexB, err := depacketizer.Unmarshal(payload)
+				assert.NoError(t, err)
+				output = append(output, annexB...)
+			}
+			assert.Equal(t, stream, output)
+		})
+	}
+}
+
+// TestH265Payloader_AddDONLToggle checks that enabling DONL on a payloader
+// does not change the packets it produces once DONL is turned off again.
+func TestH265Payloader_AddDONLToggle(t *testing.T) {
+	stream := createTestH265AnnexB(h265DONLTestStream()...)
+
+	for _, mtu := range []uint16{48, 300, 1500} {
+		reference := H265Payloader{}
+		expected := reference.Payload(mtu, stream)
+
+		payloader := H265Payloader{}
+		payloader.AddDONL = true
+		payloader.Payload(mtu, stream)
+
+		payloader = H265Payloader{}
+		payloader.AddDONL = true
+		payloader.Payload(mtu, stream)
+
+		payloader.AddDONL = false
+		assert.Equal(t, expected, payloader.Payload(mtu, stream), "mtu %d", mtu)
+	}
 }

@@ -404,7 +404,13 @@ func parseH265AggregationPacket(buf []byte, withDONL bool) (*h265AggregationPack
 func canAggregateH265(mtu uint16, packet *h265SingleNALUnitPacket) bool {
 	// must leave enough space for the AP header, optionally its DONL field, 2 length headers, a 2nd AU's header
 	// and a second packet's DOND field
-	return packet.wireSize()+(h265AggregatedPacketLengthSize*2)+h265NaluHeaderSize+1 <= int(mtu)
+	overheadSize := (h265AggregatedPacketLengthSize * 2) + h265NaluHeaderSize + 1
+	if packet.donl != nil {
+		// the AP carries a DONL field of its own
+		overheadSize += h265NaluDonlSize
+	}
+
+	return packet.wireSize()+overheadSize <= int(mtu)
 }
 
 // returns whether inserting a new packet will make this list of packets too big to aggregate within the MTU.
@@ -412,9 +418,9 @@ func shouldAggregateH265Now(mtu uint16, packets []h265SingleNALUnitPacket, newPa
 	if len(packets) < 1 {
 		return false
 	}
+	hasDonl := packets[0].donl != nil
 	// AP header + each AU's size field
 	totalSize := h265NaluHeaderSize + ((len(packets) + 1) * h265AggregatedPacketLengthSize)
-	hasDonl := packets[0].donl != nil
 	// first AU's DONL field
 	if hasDonl {
 		totalSize += 2
@@ -424,17 +430,21 @@ func shouldAggregateH265Now(mtu uint16, packets []h265SingleNALUnitPacket, newPa
 		return true
 	}
 
-	for _, p := range packets {
+	for i, p := range packets {
 		totalSize += p.wireSize()
-		// individual AUs have their DONL fields replaced with DOND (1 byte)
 		if hasDonl {
-			totalSize -= 1
+			// the AU's DONL is replaced by the AP's DONL for the first AU,
+			// and by a one byte DOND for the others
+			totalSize -= h265NaluDonlSize
+			if i > 0 {
+				totalSize++
+			}
 		}
 	}
 
 	totalSize += newPacket.wireSize()
 	if hasDonl {
-		totalSize -= 1
+		totalSize -= h265NaluDonlSize - 1
 	}
 
 	return totalSize > int(mtu)
@@ -477,17 +487,22 @@ func newH265AggregationPacket(packets []h265SingleNALUnitPacket) (*h265Aggregati
 			return nil, errMissingDonl
 		}
 		if i > 0 && packet.donl != nil {
-			// the DOND field plus 1 specifies the difference between
-			// the decoding order number values of the current aggregated NAL unit
-			// and the preceding aggregated NAL unit in the same AP.
-			dond := int(*packet.donl) - int(*lastDonl) - 1
-			if dond < 0 {
+			// the DOND field plus 1 specifies the difference between the decoding
+			// order number values of the current aggregated NAL unit and the
+			// preceding aggregated NAL unit in the same AP.
+			diff := *packet.donl - *lastDonl
+			// The difference is computed modulo 65536, so a DONL that wrapped around
+			// to zero is still in decoding order. A difference of zero is not
+			// representable, and a difference of at least 32768 means the current
+			// NAL unit actually precedes the previous one, see RFC 7798 section 4.6.
+			if diff == 0 || diff >= 1<<15 {
 				return nil, errDonlOutOfOrder
 			}
-			if dond > int(^uint8(0)) {
+			if diff > uint16(^uint8(0))+1 {
 				return nil, errDondTooLarge
 			}
-			payload = append(payload, uint8(dond))
+			// DOND carries the difference minus one, so it always fits in one byte.
+			payload = append(payload, uint8(diff-1))
 			lastDonl = packet.donl
 		}
 		// following AUs' DONs are derived from the DOND field
@@ -1740,13 +1755,29 @@ type h265ParamSetCache struct {
 
 // H265Payloader payloads H265 packets.
 type H265Payloader struct {
-	// Deprecated: Has no effect.
+	// AddDONL adds the DONL and DOND fields described in RFC 7798 to every packet.
+	// Each NAL unit is numbered, in the order it is sent, with a 16-bit decoding
+	// order number that wraps around to zero. Cached parameter sets are numbered
+	// when they are re-sent, not when they were received.
 	AddDONL bool
 	// SkipAggregation disables H265 aggregation packets.
 	SkipAggregation bool
 
+	// donl is the decoding order number that will be used for the next sent NAL unit.
+	donl uint16
+
 	// Parameter sets are cached by type and parameter-set ID.
 	cache *h265ParamSetCache
+}
+
+// nextDONL returns the decoding order number for the next NAL unit to be sent
+// and advances the counter. The counter wraps around after 65535, as the DONL
+// field only carries the 16 least significant bits of the decoding order number.
+func (p *H265Payloader) nextDONL() *uint16 {
+	donl := p.donl
+	p.donl++
+
+	return &donl
 }
 
 // HEVC parameter-set id spaces. as enforced by the RFC.
@@ -1854,17 +1885,14 @@ func (p *H265Payloader) Payload(mtu uint16, payload []byte) [][]byte { // nolint
 
 		if p.SkipAggregation {
 			p.cache = nil
-			if len(nalu) > int(mtu) {
+			if p.AddDONL {
+				packet.donl = p.nextDONL()
+			}
+			if packet.wireSize() > int(mtu) {
 				flushBuffer()
-				fragments, err := newH265FragmentationPackets(mtu, &packet)
-				if err != nil {
-					return
-				}
-				for _, fragment := range fragments {
-					payloads = append(payloads, fragment.serialize(make([]byte, 0)))
-				}
+				fragmentAndAppend(&packet)
 			} else {
-				payloads = append(payloads, nalu)
+				payloads = append(payloads, packet.serialize(make([]byte, 0, packet.wireSize())))
 			}
 
 			return
@@ -1901,6 +1929,11 @@ func (p *H265Payloader) Payload(mtu uint16, payload []byte) [][]byte { // nolint
 
 		pendingNalus = append(pendingNalus, packet)
 		for _, pending := range pendingNalus {
+			if p.AddDONL {
+				// Parameter sets are numbered when they are actually sent,
+				// which is after they were received and cached.
+				pending.donl = p.nextDONL()
+			}
 			if pending.wireSize() > int(mtu) {
 				flushBuffer()
 				fragmentAndAppend(&pending)
