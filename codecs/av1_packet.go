@@ -323,6 +323,12 @@ type AV1Packet struct {
 	// AV1Frame provides the tools to construct a collection of OBUs from a collection of OBU Elements
 	OBUElements [][]byte
 
+	// payload is the raw RTP payload backing the current OBUElements. It lets
+	// a reused instance tell a re-parse of the same packet apart from a new
+	// packet, so cached OBU elements are only reused for the exact buffer they
+	// were sliced from. Re-parsing that identical buffer stays allocation free.
+	payload []byte
+
 	// zeroAllocation prevents populating the OBUElements field
 	zeroAllocation bool
 }
@@ -330,10 +336,24 @@ type AV1Packet struct {
 // Unmarshal parses the passed byte slice and stores the result in the AV1Packet this method is called upon.
 func (p *AV1Packet) Unmarshal(payload []byte) ([]byte, error) {
 	if payload == nil {
+		p.reset()
+
 		return nil, errNilPacket
 	} else if len(payload) < 2 {
+		p.reset()
+
 		return nil, errShortPacket
 	}
+
+	// A reused instance must only reflect the packet currently being parsed.
+	// When the backing buffer changes, the OBU elements of the previous packet
+	// are dropped so they can never be returned for an unrelated packet.
+	// Re-parsing the identical buffer keeps reusing the cached elements
+	// without re-parsing, which keeps this path allocation free.
+	if !sameBackingPayload(p.payload, payload) {
+		p.OBUElements = nil
+	}
+	p.payload = payload
 
 	p.Z = ((payload[0] & av1ZMask) >> av1ZBitshift) != 0
 	p.Y = ((payload[0] & av1YMask) >> av1YBitshift) != 0
@@ -341,18 +361,46 @@ func (p *AV1Packet) Unmarshal(payload []byte) ([]byte, error) {
 	p.W = (payload[0] & av1WMask) >> av1WBitshift
 
 	if p.Z && p.N {
+		p.reset()
+
 		return nil, errIsKeyframeAndFragment
 	}
 
 	if !p.zeroAllocation {
 		obuElements, err := p.parseBody(payload[1:])
 		if err != nil {
+			// Invalidate the media and descriptor state of this instance so a
+			// failed parse leaves no state from this or a previous packet.
+			p.reset()
+
 			return nil, err
 		}
 		p.OBUElements = obuElements
 	}
 
 	return payload[1:], nil
+}
+
+// sameBackingPayload reports whether next is the exact buffer view whose OBU
+// elements are cached. Cached OBU elements are sub-slices of the previously
+// parsed payload, so reusing them is only sound for that identical backing
+// array, length and capacity; an independently allocated packet never matches
+// and is parsed from scratch. When a caller reuses one buffer and overwrites
+// it in place, the cached sub-slices already point at the new bytes, so the
+// returned elements stay consistent. Matching on buffer identity instead of
+// contents keeps the repeated re-parse allocation free.
+func sameBackingPayload(current, next []byte) bool {
+	return len(current) > 0 && len(next) > 0 &&
+		&current[0] == &next[0] && len(current) == len(next) && cap(current) == cap(next)
+}
+
+// reset invalidates every field populated by Unmarshal so the instance does
+// not retain media or descriptor state from a failed or previous packet.
+func (p *AV1Packet) reset() {
+	p.Z, p.Y, p.N = false, false, false
+	p.W = 0
+	p.OBUElements = nil
+	p.payload = nil
 }
 
 func (p *AV1Packet) parseBody(payload []byte) ([][]byte, error) {

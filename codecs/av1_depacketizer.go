@@ -45,8 +45,19 @@ func (d *AV1Depacketizer) Unmarshal(payload []byte) (buff []byte, err error) {
 	buff = make([]byte, 0)
 
 	if len(payload) <= 1 {
+		d.reset()
+
 		return nil, errShortPacket
 	}
+
+	// A failed parse invalidates the whole aggregation: drop the cached OBU
+	// fragment and the descriptor flags so a later packet can never be joined
+	// with bytes that predate the failure.
+	defer func() {
+		if err != nil {
+			d.reset()
+		}
+	}()
 
 	// |Z|Y| W |N|-|-|-|
 	obuZ := (av1ZMask & payload[0]) != 0     // Z
@@ -195,4 +206,12 @@ func (d *AV1Depacketizer) IsPartitionHead(payload []byte) bool {
 	}
 
 	return (payload[0] & av1ZMask) == 0
+}
+
+// reset drops all state carried between packets: the cached OBU fragment and
+// the aggregation header flags. It is called when a payload fails to parse so
+// subsequent packets cannot be combined with pre-failure state.
+func (d *AV1Depacketizer) reset() {
+	d.buffer = nil
+	d.Z, d.Y, d.N = false, false, false
 }

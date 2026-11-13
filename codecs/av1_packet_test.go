@@ -9,6 +9,7 @@ import (
 
 	"github.com/pion/rtp/codecs/av1/obu"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testAV1AggregationHeader struct {
@@ -1864,6 +1865,94 @@ func TestAV1_Unmarshal_Error(t *testing.T) {
 	}
 }
 
+// A reused AV1Packet must reflect only the packet it last parsed, never the
+// OBU elements of an earlier packet.
+func TestAV1_Unmarshal_ReuseDoesNotReturnStaleElements(t *testing.T) {
+	p := &AV1Packet{}
+
+	first := []byte{0x10, 0x30, 0x01} // W=1, one OBU element
+	_, err := p.Unmarshal(first)
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{{0x30, 0x01}}, p.OBUElements)
+
+	// A distinct packet (separate backing array) re-parses from scratch.
+	second := []byte{0x10, 0x32, 0x00}
+	_, err = p.Unmarshal(second)
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{{0x32, 0x00}}, p.OBUElements)
+
+	// A third packet with multiple elements must not expose the cached pair.
+	third := []byte{0x20, 0x01, 0xAA, 0xBB}
+	_, err = p.Unmarshal(third)
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{{0xAA}, {0xBB}}, p.OBUElements)
+}
+
+// When a transport reuses one backing buffer to carry consecutive packets,
+// the cached elements must still be replaced because the bytes differ.
+func TestAV1_Unmarshal_ReusedBackingBufferWithNewContent(t *testing.T) {
+	p := &AV1Packet{}
+	buf := make([]byte, 3)
+
+	copy(buf, []byte{0x10, 0x30, 0x01})
+	_, err := p.Unmarshal(buf)
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{{0x30, 0x01}}, p.OBUElements)
+
+	copy(buf, []byte{0x10, 0x32, 0x00})
+	_, err = p.Unmarshal(buf)
+	require.NoError(t, err)
+	assert.Equal(t, [][]byte{{0x32, 0x00}}, p.OBUElements)
+}
+
+// Re-parsing the exact same packet keeps returning the same elements without
+// allocating (the documented zero-allocation fast path).
+func TestAV1_Unmarshal_RepeatedSamePacketIsZeroAllocation(t *testing.T) {
+	payload := []byte{0x20, 0x01, 0xAA, 0xBB}
+	p := &AV1Packet{}
+
+	_, err := p.Unmarshal(payload)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{{0xAA}, {0xBB}}, p.OBUElements)
+
+	// The measured closure only touches package-level state to avoid
+	// capturing variables, which would itself allocate.
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = p.Unmarshal(payload)
+	})
+	assert.Equal(t, 0.0, allocs)
+	assert.Equal(t, [][]byte{{0xAA}, {0xBB}}, p.OBUElements)
+}
+
+// A failed parse must invalidate both the media elements and descriptor flags
+// so a reused instance never exposes state from the failed or prior packet.
+func TestAV1_Unmarshal_FailureInvalidatesState(t *testing.T) {
+	p := &AV1Packet{}
+
+	_, err := p.Unmarshal([]byte{0x10, 0x30, 0x01})
+	require.NoError(t, err)
+	require.NotNil(t, p.OBUElements)
+
+	// Malformed body: declared length overruns the payload.
+	_, err = p.Unmarshal([]byte{0x00, 0x09, 0x01})
+	require.ErrorIs(t, err, errShortPacket)
+	assert.Nil(t, p.OBUElements)
+	assert.Nil(t, p.payload)
+	assert.False(t, p.Z)
+	assert.False(t, p.Y)
+	assert.False(t, p.N)
+	assert.Equal(t, byte(0), p.W)
+
+	// The Z&&N contradiction path must reset as well.
+	_, err = p.Unmarshal([]byte{0x10, 0x30, 0x01})
+	require.NoError(t, err)
+	_, err = p.Unmarshal([]byte{0x88, 0x00})
+	require.ErrorIs(t, err, errIsKeyframeAndFragment)
+	assert.Nil(t, p.OBUElements)
+	assert.False(t, p.N)
+	assert.False(t, p.Z)
+}
+
 func TestAV1_Unmarshal(t *testing.T) {
 	// nolint: dupl
 	av1Payload := []byte{
@@ -2051,6 +2140,7 @@ func TestAV1_Unmarshal(t *testing.T) {
 			av1Payload[2:14],
 			av1Payload[14:],
 		},
+		payload: av1Payload,
 	}
 	assert.Equal(t, expect, av1Pkt, "AV1 Unmarshal didn't store the expected results in the packet")
 }

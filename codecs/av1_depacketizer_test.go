@@ -592,3 +592,68 @@ func TestAV1Depacketizer_fragmentAllocationGrowth(t *testing.T) {
 	})
 	assert.Less(t, allocations, float64(64))
 }
+
+// A failed parse must invalidate the cached OBU fragment so a later
+// continuation packet can never be stitched together with bytes that predate
+// the failure. This reproduces the malformed-aggregate corruption where a
+// half OBU was handed to the decoder.
+func TestAV1Depacketizer_failureDropsCachedFragment(t *testing.T) {
+	d := &AV1Depacketizer{}
+
+	// First packet carries a fragmented last OBU (Y=1); its fragment is cached.
+	first := []byte{0x41, 0x02, 0x50, 0x20}
+	out, err := d.Unmarshal(first)
+	require.NoError(t, err)
+	assert.Empty(t, out)
+	require.NotNil(t, d.buffer)
+
+	// A malformed aggregate (Z=1 so the cached fragment is retained up to the
+	// parse, then a bad LEB128 length field makes Unmarshal fail).
+	bad := []byte{0x80, 0xFF}
+	_, err = d.Unmarshal(bad)
+	require.Error(t, err)
+
+	// The failure must have discarded the cached fragment and descriptor flags.
+	assert.Nil(t, d.buffer)
+	assert.False(t, d.Z)
+	assert.False(t, d.Y)
+	assert.False(t, d.N)
+
+	// The following continuation (Z=1) has no fragment to join and is dropped
+	// rather than merged into the pre-failure bytes.
+	cont := []byte{0x81, 0x01, 0x99}
+	out, err = d.Unmarshal(cont)
+	require.NoError(t, err)
+	assert.Empty(t, out)
+	assert.Nil(t, d.buffer)
+}
+
+// A short/invalid first packet must likewise leave no descriptor state behind.
+func TestAV1Depacketizer_failureResetsDescriptors(t *testing.T) {
+	d := &AV1Depacketizer{}
+
+	_, err := d.Unmarshal([]byte{0x00})
+	require.ErrorIs(t, err, errShortPacket)
+	assert.Nil(t, d.buffer)
+	assert.False(t, d.Z)
+	assert.False(t, d.Y)
+	assert.False(t, d.N)
+}
+
+// After a failure, a well-formed independent packet (Z=0) still parses
+// normally: dropping state must not poison subsequent valid packets.
+func TestAV1Depacketizer_recoversAfterFailure(t *testing.T) {
+	d := &AV1Depacketizer{}
+
+	_, err := d.Unmarshal([]byte{0x80, 0xFF})
+	require.Error(t, err)
+
+	newOBU, expected := createAV1OBU(obu.OBUTileGroup, []byte{0x04, 0x05, 0x06})
+	packet := append(
+		append([]byte{0x00}, obu.WriteToLeb128(uint(len(newOBU)))...),
+		newOBU...,
+	)
+	out, err := d.Unmarshal(packet)
+	require.NoError(t, err)
+	assert.Equal(t, expected, out)
+}

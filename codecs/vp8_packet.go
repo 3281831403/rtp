@@ -111,10 +111,20 @@ type VP8Packet struct {
 }
 
 // Unmarshal parses the passed byte slice and stores the result in the VP8Packet this method is called upon.
-func (p *VP8Packet) Unmarshal(payload []byte) ([]byte, error) { //nolint:gocognit,cyclop
+func (p *VP8Packet) Unmarshal(payload []byte) (media []byte, err error) { //nolint:gocognit,cyclop
 	if payload == nil {
+		p.reset()
+
 		return nil, errNilPacket
 	}
+
+	// On any parse failure invalidate the media payload and descriptor state
+	// of this instance instead of leaving data from a previous packet behind.
+	defer func() {
+		if err != nil {
+			p.reset()
+		}
+	}()
 
 	payloadLen := len(payload)
 
@@ -204,6 +214,16 @@ func (p *VP8Packet) Unmarshal(payload []byte) ([]byte, error) { //nolint:gocogni
 	p.Payload = payload[payloadIndex:]
 
 	return p.Payload, nil
+}
+
+// reset invalidates the parsed header fields and media payload so a reused
+// instance never retains state from a failed or previous packet.
+func (p *VP8Packet) reset() {
+	p.X, p.N, p.S, p.PID = 0, 0, 0, 0
+	p.I, p.L, p.T, p.K = 0, 0, 0, 0
+	p.PictureID, p.TL0PICIDX = 0, 0
+	p.TID, p.Y, p.KEYIDX = 0, 0, 0
+	p.Payload = nil
 }
 
 // VP8PartitionHeadChecker checks VP8 partition head
