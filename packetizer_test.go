@@ -73,6 +73,39 @@ func TestPacketizer_AbsSendTime(t *testing.T) {
 	assert.Equal(t, expected, packets[0], "Packetize failed")
 }
 
+func TestPacketizer_AbsSendTimeRespectsMTU(t *testing.T) {
+	// With abs-send-time enabled the packetizer must reserve space for the
+	// extension (4 bytes extension header + 4 bytes one-byte element) so the
+	// last packet does not grow past the MTU.
+	const mtu = 100
+	pktizer := NewPacketizer(mtu, 98, 0x1234ABCD, &codecs.G722Payloader{}, NewFixedSequencer(1234), 90000)
+	pktizer.EnableAbsSendTime(1)
+
+	packets := pktizer.Packetize(make([]byte, 200), 2000)
+
+	// payload budget is 100-12-8=80 bytes per packet: 80+80+40
+	assert.Len(t, packets, 3)
+	assert.Len(t, packets[0].Payload, 80)
+	assert.Len(t, packets[1].Payload, 80)
+	assert.Len(t, packets[2].Payload, 40)
+
+	for i, pkt := range packets {
+		raw, err := pkt.Marshal()
+		assert.NoError(t, err)
+		assert.LessOrEqualf(t, len(raw), mtu, "packet %d exceeds MTU", i)
+
+		back := &Packet{}
+		assert.NoError(t, back.Unmarshal(raw))
+	}
+
+	// the abs-send-time extension is only on the last packet
+	assert.False(t, packets[0].Extension)
+	assert.False(t, packets[1].Extension)
+	assert.True(t, packets[2].Extension)
+	// 12 bytes header + 8 bytes extension block + 40 bytes payload
+	assert.Equal(t, 60, packets[2].MarshalSize())
+}
+
 func TestPacketizer_Roundtrip(t *testing.T) {
 	multiplepayload := make([]byte, 128)
 	packetizer := NewPacketizer(100, 98, 0x1234ABCD, &codecs.G722Payloader{}, NewRandomSequencer(), 90000)
@@ -246,8 +279,12 @@ func FuzzPacketizer_Packetize_G722(f *testing.F) {
 			return
 		}
 
-		eff := int(mtu - 12)
-		if eff == 0 {
+		eff := int(mtu) - 12
+		if enableAST {
+			// the packetizer reserves space for the abs-send-time extension
+			eff -= 8
+		}
+		if eff <= 0 {
 			assert.Equal(t, 0, len(packets))
 
 			return
@@ -275,17 +312,14 @@ func FuzzPacketizer_Packetize_G722(f *testing.F) {
 				assert.False(t, packet.Marker)
 			}
 
-			if mtu >= 12 && !enableAST {
-				raw, err := packet.Marshal()
-				assert.NoError(t, err)
-				assert.LessOrEqual(t, len(raw), int(mtu))
-			} else {
-				raw, err := packet.Marshal()
-				assert.NoError(t, err)
+			raw, err := packet.Marshal()
+			assert.NoError(t, err)
+			// no packet may exceed the MTU, including the abs-send-time
+			// extension on the last packet
+			assert.LessOrEqual(t, len(raw), int(mtu))
 
-				var back Packet
-				assert.NoError(t, back.Unmarshal(raw))
-			}
+			var back Packet
+			assert.NoError(t, back.Unmarshal(raw))
 		}
 	})
 }
@@ -331,20 +365,32 @@ func FuzzPacketizer_SkipSamples_And_Timestamps(f *testing.F) {
 			packetizer.EnableAbsSendTime(1)
 		}
 
+		// no packet is produced when the MTU cannot fit even an empty payload
+		eff := int(mtu) - 12
+		if enableAST {
+			eff -= 8
+		}
+
 		packetizer.SkipSamples(skip)
 
 		pkts1 := packetizer.Packetize(p1, samples1)
-		if len(p1) == 0 {
+		switch {
+		case len(p1) == 0:
 			assert.Nil(t, pkts1)
-		} else {
+		case eff <= 0:
+			assert.Empty(t, pkts1)
+		default:
 			assert.GreaterOrEqual(t, len(pkts1), 1)
 			assert.Equal(t, startTS+skip, pkts1[0].Timestamp)
 		}
 
 		pkts2 := packetizer.Packetize(p2, samples2)
-		if len(p2) == 0 {
+		switch {
+		case len(p2) == 0:
 			assert.Nil(t, pkts2)
-		} else {
+		case eff <= 0:
+			assert.Empty(t, pkts2)
+		default:
 			assert.GreaterOrEqual(t, len(pkts2), 1)
 			expectedTS2 := startTS + skip + samples1
 			assert.Equal(t, expectedTS2, pkts2[0].Timestamp)

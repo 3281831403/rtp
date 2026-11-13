@@ -444,6 +444,69 @@ func TestVLAMarshalThenUnmarshal(t *testing.T) {
 
 		assert.Equal(t, vla0, vla1)
 	})
+
+	t.Run("mid stream paused round trips byte exact", func(t *testing.T) {
+		// stream 1 of 3 is paused (no spatial layers): the common sl_bm form
+		// cannot be used, per-stream bitmaps must be sent instead.
+		expected, err := hex.DecodeString("601010109601d005b009013f00b31e04ff02cf1e")
+		assert.NoError(t, err)
+
+		vla0 := &VLA{}
+		n, err := vla0.Unmarshal(expected)
+		assert.NoError(t, err)
+		assert.Equal(t, len(expected), n)
+		assert.Len(t, vla0.ActiveSpatialLayer, 2, "paused stream must not gain layers")
+
+		actual, err := vla0.Marshal()
+		assert.NoError(t, err)
+		assert.Equal(t, expected, actual, "re-marshaled VLA differs from the original packet")
+
+		vla1 := &VLA{}
+		_, err = vla1.Unmarshal(actual)
+		assert.NoError(t, err)
+		assert.Equal(t, vla0, vla1)
+	})
+
+	t.Run("single stream paused", func(t *testing.T) {
+		vla0 := &VLA{
+			RTPStreamID:    0,
+			RTPStreamCount: 1,
+		}
+
+		actual, err := vla0.Marshal()
+		assert.NoError(t, err)
+		// RID/NS/sl_bm, one sl0_bm byte, one (empty) #tl byte
+		assert.Equal(t, []byte{0x00, 0x00, 0x00}, actual)
+
+		vla1 := &VLA{}
+		n, err := vla1.Unmarshal(actual)
+		assert.NoError(t, err)
+		assert.Equal(t, len(actual), n)
+		assert.Equal(t, vla0, vla1)
+	})
+
+	t.Run("two streams with different sparse bitmasks", func(t *testing.T) {
+		vla0 := &VLA{
+			RTPStreamID:    0,
+			RTPStreamCount: 2,
+			ActiveSpatialLayer: []SpatialLayer{
+				{RTPStreamID: 0, SpatialID: 0, TargetBitrates: []int{100}},
+				{RTPStreamID: 1, SpatialID: 0, TargetBitrates: []int{100}},
+				{RTPStreamID: 1, SpatialID: 1, TargetBitrates: []int{100}},
+			},
+		}
+
+		actual, err := vla0.Marshal()
+		assert.NoError(t, err)
+		// sl_bm=0, sl0_bm/sl1_bm=0x13, one #tl byte, three LEB128 bitrates
+		assert.Equal(t, []byte{0x10, 0x13, 0x00, 0x64, 0x64, 0x64}, actual)
+
+		vla1 := &VLA{}
+		n, err := vla1.Unmarshal(actual)
+		assert.NoError(t, err)
+		assert.Equal(t, len(actual), n)
+		assert.Equal(t, vla0, vla1)
+	})
 }
 
 func FuzzVLAUnmarshal(f *testing.F) {

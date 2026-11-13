@@ -423,16 +423,28 @@ func (h *Header) SetExtension(id uint8, payload []byte) error { //nolint:gocogni
 		return nil
 	}
 
-	// No existing header extensions
-	h.Extension = true
-
-	switch payloadLen := len(payload); {
-	case payloadLen <= 16:
+	// No existing header extensions: pick the most compact profile that can
+	// actually represent the id and payload. A one-byte header can only hold
+	// ids 1-14 and payloads of 1-16 bytes; anything else (e.g. id 15, which is
+	// reserved in the one-byte form, or an empty payload) needs a two-byte
+	// header.
+	switch {
+	case id >= 1 && id <= 14 && len(payload) >= 1 && len(payload) <= 16:
 		h.ExtensionProfile = ExtensionProfileOneByte
-	case payloadLen > 16 && payloadLen < 256:
+	case id >= 1:
 		h.ExtensionProfile = ExtensionProfileTwoByte
+	default:
+		// Let headerExtensionCheck produce the id range error.
+		h.ExtensionProfile = ExtensionProfileOneByte
 	}
 
+	if err := headerExtensionCheck(h.ExtensionProfile, id, payload); err != nil {
+		h.ExtensionProfile = 0
+
+		return err
+	}
+
+	h.Extension = true
 	h.Extensions = append(h.Extensions, Extension{id: id, payload: payload})
 
 	return nil

@@ -112,13 +112,14 @@ func (v VLA) analyzeVLAForMarshaling(ctx *vlaMarshalingContext) error {
 		return err
 	}
 
-	ctx.commonSLBM = commonSLBMValues(ctx.slMBs[:])
+	ctx.commonSLBM = commonSLBMValues(ctx.slMBs[:], v.RTPStreamCount)
 
 	// RID, NS, sl_bm fields
 	if ctx.commonSLBM != 0 {
 		ctx.requiredLen = 1
 	} else {
-		ctx.requiredLen = 3
+		// sl_bm sent per stream: one byte holds two 4-bit bitmaps
+		ctx.requiredLen = 1 + (v.RTPStreamCount-1)/2 + 1
 	}
 
 	// #tl fields
@@ -164,7 +165,7 @@ func (v VLA) MarshalTo(buf []byte) (int, error) { //nolint:cyclop,gocognit
 		offset++
 		for streamID := 0; streamID < v.RTPStreamCount; streamID++ {
 			if streamID%2 == 0 {
-				buf[offset+streamID/2] |= ctx.slMBs[streamID] << 4
+				buf[offset+streamID/2] = ctx.slMBs[streamID] << 4
 			} else {
 				buf[offset+streamID/2] |= ctx.slMBs[streamID]
 			}
@@ -174,6 +175,7 @@ func (v VLA) MarshalTo(buf []byte) (int, error) { //nolint:cyclop,gocognit
 
 	// #tl fields
 	offset++
+	buf[offset] = 0
 	var temporalLayerIndex int
 	for rtpStreamID := 0; rtpStreamID < v.RTPStreamCount; rtpStreamID++ {
 		for spatialID := range 4 {
@@ -181,6 +183,7 @@ func (v VLA) MarshalTo(buf []byte) (int, error) { //nolint:cyclop,gocognit
 				if temporalLayerIndex >= 4 {
 					temporalLayerIndex = 0
 					offset++
+					buf[offset] = 0
 				}
 				//nolint:gosec // values are small
 				buf[offset] |= byte(len(v.ActiveSpatialLayer[idx].TargetBitrates)-1) << (2 * (3 - temporalLayerIndex))
@@ -230,17 +233,13 @@ func (v VLA) Marshal() ([]byte, error) {
 	return buf, nil
 }
 
-func commonSLBMValues(slMBs []uint8) uint8 {
-	var common uint8
-	for i := range slMBs {
-		if slMBs[i] == 0 {
-			continue
-		}
-		if common == 0 {
-			common = slMBs[i]
-
-			continue
-		}
+// commonSLBMValues returns the shared spatial layer bitmask when every RTP
+// stream uses the same bitmask, or 0 when per-stream bitmasks must be sent.
+// A paused stream has no active layers (bitmask 0), so it only shares a common
+// bitmask if all streams are paused.
+func commonSLBMValues(slMBs []uint8, streamCount int) uint8 {
+	common := slMBs[0]
+	for i := 1; i < streamCount; i++ {
 		if slMBs[i] != common {
 			return 0
 		}

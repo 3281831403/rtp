@@ -214,6 +214,11 @@ func TestHeaderExtension_Invalid(t *testing.T) {
 	assert.Error(t, twoByteExt.Set(0, nil))
 	assert.Error(t, oneByteExt.Set(15, nil))
 
+	// An empty payload cannot be expressed with a one-byte header
+	assert.Error(t, oneByteExt.Set(1, nil))
+	assert.Error(t, oneByteExt.Set(1, []byte{}))
+	assert.NoError(t, twoByteExt.Set(1, nil))
+
 	// Extension too large
 	assert.Error(t, oneByteExt.Set(10, make([]byte, 255)))
 	assert.Error(t, twoByteExt.Set(10, make([]byte, 500)))
@@ -288,17 +293,118 @@ func TestHeaderExtension_RFC8285TwoByteExtensionRewrite(t *testing.T) {
 	assert.NoError(t, ext.Set(200, []byte{0x01, 0x02, 0x03}))
 	res, err := ext.Marshal()
 	assert.NoError(t, err)
-	assert.Equal(t, res, []byte{0x10, 0x00, 0x00, 0x01, 0xc8, 0x03, 0x01, 0x02, 0x03})
+	assert.Equal(t, res, []byte{0x10, 0x00, 0x00, 0x02, 0xc8, 0x03, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00})
 
 	assert.NoError(t, ext.Set(200, []byte{0x04, 0x05, 0x06}))
 	res, err = ext.Marshal()
 	assert.NoError(t, err)
-	assert.Equal(t, res, []byte{0x10, 0x00, 0x00, 0x01, 0xc8, 0x03, 0x04, 0x05, 0x06})
+	assert.Equal(t, res, []byte{0x10, 0x00, 0x00, 0x02, 0xc8, 0x03, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00})
 
 	assert.NoError(t, ext.Set(50, []byte{0x07, 0x08, 0x09}))
 	res, err = ext.Marshal()
 	assert.NoError(t, err)
-	assert.Equal(t, res, []byte{0x10, 0x00, 0x00, 0x02, 0xc8, 0x03, 0x04, 0x05, 0x06, 0x32, 0x03, 0x07, 0x08, 0x09})
+	assert.Equal(
+		t,
+		res,
+		[]byte{0x10, 0x00, 0x00, 0x03, 0xc8, 0x03, 0x04, 0x05, 0x06, 0x32, 0x03, 0x07, 0x08, 0x09, 0x00, 0x00},
+	)
+}
+
+func TestHeaderExtension_RFC8285OneByteExtensionResize(t *testing.T) {
+	ext := &OneByteHeaderExtension{}
+	assert.NoError(t, ext.Set(1, []byte{0x01, 0x02, 0x03}))
+	res, err := ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xBE, 0xDE, 0x00, 0x01, 0x12, 0x01, 0x02, 0x03}, res)
+
+	// shrink the extension: the length field must stay in sync
+	assert.NoError(t, ext.Set(1, []byte{0x04}))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xBE, 0xDE, 0x00, 0x01, 0x10, 0x04, 0x00, 0x00}, res)
+	assert.Equal(t, []byte{0x04}, ext.Get(1))
+
+	// grow the extension: padding is only added at the tail
+	assert.NoError(t, ext.Set(1, []byte{0x05, 0x06}))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xBE, 0xDE, 0x00, 0x01, 0x11, 0x05, 0x06, 0x00}, res)
+	assert.Equal(t, []byte{0x05, 0x06}, ext.Get(1))
+
+	// deleting an extension must update the length field
+	assert.NoError(t, ext.Set(2, []byte{0x07}))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xBE, 0xDE, 0x00, 0x02, 0x11, 0x05, 0x06, 0x20, 0x07, 0x00, 0x00, 0x00}, res)
+
+	assert.NoError(t, ext.Del(1))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xBE, 0xDE, 0x00, 0x01, 0x20, 0x07, 0x00, 0x00}, res)
+	assert.Nil(t, ext.Get(1))
+	assert.Equal(t, []byte{0x07}, ext.Get(2))
+
+	assert.NoError(t, ext.Del(2))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0xBE, 0xDE, 0x00, 0x00}, res)
+}
+
+func TestHeaderExtension_RFC8285OneByteSetCompactsExtensions(t *testing.T) {
+	ext := &OneByteHeaderExtension{}
+
+	// extensions with padding bytes interleaved
+	_, err := ext.Unmarshal([]byte{
+		0xBE, 0xDE, 0x00, 0x03, 0x10, 0xAA, 0x21, 0xBB,
+		0xBB, 0x00, 0x00, 0x33, 0xCC, 0xCC, 0xCC, 0xCC,
+	})
+	assert.NoError(t, err, "Unmarshal err for valid extension")
+
+	// a Set repacks the extensions tightly and only pads the tail
+	assert.NoError(t, ext.Set(2, []byte{0xDD}))
+	res, err := ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0xBE, 0xDE, 0x00, 0x03, 0x10, 0xAA, 0x20, 0xDD,
+		0x33, 0xCC, 0xCC, 0xCC, 0xCC, 0x00, 0x00, 0x00,
+	}, res)
+
+	assert.Equal(t, []byte{0xAA}, ext.Get(1))
+	assert.Equal(t, []byte{0xDD}, ext.Get(2))
+	assert.Equal(t, []byte{0xCC, 0xCC, 0xCC, 0xCC}, ext.Get(3))
+}
+
+func TestHeaderExtension_RFC8285TwoByteExtensionResize(t *testing.T) {
+	ext := &TwoByteHeaderExtension{}
+	assert.NoError(t, ext.Set(1, []byte{0x01, 0x02, 0x03}))
+	res, err := ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x10, 0x00, 0x00, 0x02, 0x01, 0x03, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00}, res)
+
+	// shrink the extension: the length field must stay in sync
+	assert.NoError(t, ext.Set(1, []byte{0x04}))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x10, 0x00, 0x00, 0x01, 0x01, 0x01, 0x04, 0x00}, res)
+	assert.Equal(t, []byte{0x04}, ext.Get(1))
+
+	// deleting an extension must update the length field
+	assert.NoError(t, ext.Set(2, []byte{0x05}))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x10, 0x00, 0x00, 0x02, 0x01, 0x01, 0x04, 0x02, 0x01, 0x05, 0x00, 0x00}, res)
+
+	assert.NoError(t, ext.Del(1))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x10, 0x00, 0x00, 0x01, 0x02, 0x01, 0x05, 0x00}, res)
+	assert.Nil(t, ext.Get(1))
+	assert.Equal(t, []byte{0x05}, ext.Get(2))
+
+	assert.NoError(t, ext.Del(2))
+	res, err = ext.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x10, 0x00, 0x00, 0x00}, res)
 }
 
 func TestHeaderExtension_Raw(t *testing.T) {

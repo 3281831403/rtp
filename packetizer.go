@@ -111,6 +111,28 @@ func (p *packetizer) EnableAbsSendTime(value int) {
 	p.extensionNumbers.AbsSendTime = value
 }
 
+// payloadMTU returns the maximum payload size for a single packet, reserving
+// space for the RTP header and for the header extensions the packetizer adds
+// itself, so that no marshaled packet exceeds p.MTU.
+func (p *packetizer) payloadMTU() uint16 {
+	overhead := uint16(12) // RTP header
+	if p.extensionNumbers.AbsSendTime != 0 {
+		// 4 bytes of extension header plus the abs-send-time element:
+		// 1+3 bytes with a one-byte header, 2+3 bytes (padded to 8) when the
+		// negotiated id requires a two-byte header.
+		if p.extensionNumbers.AbsSendTime <= 14 {
+			overhead += 8
+		} else {
+			overhead += 12
+		}
+	}
+	if p.MTU <= overhead {
+		return 0
+	}
+
+	return p.MTU - overhead
+}
+
 // Packetize packetizes the payload of an RTP packet and returns one or more RTP packets.
 func (p *packetizer) Packetize(payload []byte, samples uint32) []*Packet {
 	// Guard against an empty payload
@@ -120,7 +142,7 @@ func (p *packetizer) Packetize(payload []byte, samples uint32) []*Packet {
 		return nil
 	}
 
-	payloads := p.Payloader.Payload(p.MTU-12, payload)
+	payloads := p.Payloader.Payload(p.payloadMTU(), payload)
 	packets := make([]*Packet, len(payloads))
 
 	for i, pp := range payloads {

@@ -1164,6 +1164,80 @@ func TestRFC8285TwoByteSetExtensionShouldErrorWhenPayloadTooLarge(t *testing.T) 
 	assert.Error(t, err, "SetExtension did not error on too large payload")
 }
 
+func TestRFC8285SetExtensionOnNewPacketUsesTwoByteProfileWhenOneByteCannotRepresent(t *testing.T) {
+	// id 15 is reserved in the one-byte form, so a two-byte header must be
+	// used and the extension must survive a marshal/unmarshal round trip.
+	packet := &Packet{Header: Header{Version: 2}}
+	assert.NoError(t, packet.SetExtension(15, []byte{0xAA}))
+	assert.True(t, packet.Extension)
+	assert.Equal(t, uint16(0x1000), packet.ExtensionProfile)
+
+	raw, err := packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x01,
+		0x0F, 0x01, 0xAA, 0x00,
+	}, raw)
+
+	parsed := &Packet{}
+	assert.NoError(t, parsed.Unmarshal(raw))
+	assert.Equal(t, []byte{0xAA}, parsed.GetExtension(15))
+
+	// ids above 14 cannot be expressed with a one-byte header either.
+	packet = &Packet{Header: Header{Version: 2}}
+	assert.NoError(t, packet.SetExtension(16, []byte{0xBB}))
+	assert.Equal(t, uint16(0x1000), packet.ExtensionProfile)
+
+	raw, err = packet.Marshal()
+	assert.NoError(t, err)
+	parsed = &Packet{}
+	assert.NoError(t, parsed.Unmarshal(raw))
+	assert.Equal(t, []byte{0xBB}, parsed.GetExtension(16))
+
+	// An empty payload has no one-byte representation (the 4-bit length
+	// field stores len-1), so a two-byte header must be used.
+	packet = &Packet{Header: Header{Version: 2}}
+	assert.NoError(t, packet.SetExtension(1, []byte{}))
+	assert.Equal(t, uint16(0x1000), packet.ExtensionProfile)
+
+	raw, err = packet.Marshal()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x01,
+		0x01, 0x00, 0x00, 0x00,
+	}, raw)
+
+	parsed = &Packet{}
+	assert.NoError(t, parsed.Unmarshal(raw))
+	assert.Equal(t, []uint8{1}, parsed.GetExtensionIDs())
+	assert.Empty(t, parsed.GetExtension(1))
+}
+
+func TestRFC8285SetExtensionOnNewPacketShouldErrorWhenNotRepresentable(t *testing.T) {
+	// id 0 is padding in both RFC 8285 forms.
+	packet := &Packet{Header: Header{Version: 2}}
+	assert.Error(t, packet.SetExtension(0, []byte{0xAA}))
+	assert.False(t, packet.Extension)
+
+	// payloads above 255 bytes fit neither RFC 8285 form.
+	packet = &Packet{Header: Header{Version: 2}}
+	assert.Error(t, packet.SetExtension(1, make([]byte, 300)))
+	assert.False(t, packet.Extension)
+
+	// an empty payload cannot be added to an existing one-byte header.
+	packet = &Packet{
+		Header: Header{
+			Version:          2,
+			Extension:        true,
+			ExtensionProfile: 0xBEDE,
+			Extensions:       []Extension{{1, []byte{0xAA}}},
+		},
+	}
+	assert.Error(t, packet.SetExtension(2, []byte{}))
+}
+
 func TestRFC8285Padding(t *testing.T) {
 	header := &Header{}
 

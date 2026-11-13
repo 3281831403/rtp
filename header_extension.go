@@ -4,7 +4,6 @@
 package rtp
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -50,38 +49,73 @@ func (e *OneByteHeaderExtension) Set(id uint8, buf []byte) error {
 		return err
 	}
 
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
+	extensions := parseOneByteExtensions(e.payload)
+
+	updated := false
+	for i := range extensions {
+		if extensions[i].id == id {
+			extensions[i].payload = buf
+			updated = true
+
+			break
+		}
+	}
+	if !updated {
+		extensions = append(extensions, Extension{id: id, payload: buf})
+	}
+
+	e.payload = marshalOneByteExtensions(extensions)
+
+	return nil
+}
+
+// parseOneByteExtensions extracts the extensions from a marshaled RFC 8285
+// one-byte header extension block (including the 4-byte profile/length
+// header), skipping any padding bytes.
+func parseOneByteExtensions(payload []byte) []Extension {
+	var extensions []Extension
+	for n := 4; n < len(payload); {
+		if payload[n] == 0x00 { // padding
 			n++
 
 			continue
 		}
 
-		extid := e.payload[n] >> 4
-		payloadLen := int(e.payload[n]&^0xF0 + 1)
+		extid := payload[n] >> 4
+		payloadLen := int(payload[n]&^0xF0 + 1)
 		n++
 
-		if n+payloadLen > len(e.payload) {
+		if extid == headerExtensionIDReserved || extid == extensionIDPadding {
 			break
 		}
 
-		if extid == id {
-			e.payload = append(e.payload[:n], append(buf, e.payload[n+payloadLen:]...)...)
-
-			return nil
+		if n+payloadLen > len(payload) {
+			break
 		}
+
+		extensions = append(extensions, Extension{id: extid, payload: payload[n : n+payloadLen]})
 		n += payloadLen
 	}
 
-	if len(e.payload) == 0 && !bytes.HasPrefix(buf, []byte{0xBE, 0xDE, 0x00, 0x00}) {
-		e.payload = []byte{0xBE, 0xDE, 0x00, 0x00}
+	return extensions
+}
+
+// marshalOneByteExtensions serializes extensions as an RFC 8285 one-byte
+// header extension block. Extensions are packed tightly, zero padding is only
+// added at the tail to reach a 32-bit boundary, and the length field is kept
+// in sync with the actual payload.
+func marshalOneByteExtensions(extensions []Extension) []byte {
+	payload := []byte{0xBE, 0xDE, 0x00, 0x00}
+	for _, extension := range extensions {
+		payload = append(payload, extension.id<<4|uint8(len(extension.payload)-1)) // nolint: gosec // G115
+		payload = append(payload, extension.payload...)
 	}
+	for len(payload)%4 != 0 {
+		payload = append(payload, 0x00)
+	}
+	binary.BigEndian.PutUint16(payload[2:4], uint16((len(payload)-4)/4)) // nolint: gosec // G115
 
-	e.payload = append(e.payload, (id<<4 | uint8(len(buf)-1))) // nolint: gosec // G115
-	e.payload = append(e.payload, buf...)
-	binary.BigEndian.PutUint16(e.payload[2:4], binary.BigEndian.Uint16(e.payload[2:4])+1)
-
-	return nil
+	return payload
 }
 
 // GetIDs returns the available IDs.
@@ -144,26 +178,13 @@ func (e *OneByteHeaderExtension) Get(id uint8) []byte {
 
 // Del deletes the extension with the specified ID.
 func (e *OneByteHeaderExtension) Del(id uint8) error {
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
-			n++
-
-			continue
-		}
-
-		extid := e.payload[n] >> 4
-		payloadLen := int(e.payload[n]&^0xF0 + 1)
-
-		if n+1+payloadLen > len(e.payload) {
-			break
-		}
-
-		if extid == id {
-			e.payload = append(e.payload[:n], e.payload[n+1+payloadLen:]...)
+	extensions := parseOneByteExtensions(e.payload)
+	for i := range extensions {
+		if extensions[i].id == id {
+			e.payload = marshalOneByteExtensions(append(extensions[:i], extensions[i+1:]...))
 
 			return nil
 		}
-		n += payloadLen + 1
 	}
 
 	return errHeaderExtensionNotFound
@@ -218,44 +239,75 @@ func (e *TwoByteHeaderExtension) Set(id uint8, buf []byte) error {
 		return err
 	}
 
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
+	extensions := parseTwoByteExtensions(e.payload)
+
+	updated := false
+	for i := range extensions {
+		if extensions[i].id == id {
+			extensions[i].payload = buf
+			updated = true
+
+			break
+		}
+	}
+	if !updated {
+		extensions = append(extensions, Extension{id: id, payload: buf})
+	}
+
+	e.payload = marshalTwoByteExtensions(extensions)
+
+	return nil
+}
+
+// parseTwoByteExtensions extracts the extensions from a marshaled RFC 8285
+// two-byte header extension block (including the 4-byte profile/length
+// header), skipping any padding bytes.
+func parseTwoByteExtensions(payload []byte) []Extension {
+	var extensions []Extension
+	for n := 4; n < len(payload); {
+		if payload[n] == 0x00 { // padding
 			n++
 
 			continue
 		}
 
-		extid := e.payload[n]
+		extid := payload[n]
 		n++
 
-		if n >= len(e.payload) {
+		if n >= len(payload) {
 			break
 		}
 
-		payloadLen := int(e.payload[n])
+		payloadLen := int(payload[n])
 		n++
 
-		if n+payloadLen > len(e.payload) {
+		if n+payloadLen > len(payload) {
 			break
 		}
 
-		if extid == id {
-			e.payload = append(e.payload[:n], append(buf, e.payload[n+payloadLen:]...)...)
-
-			return nil
-		}
+		extensions = append(extensions, Extension{id: extid, payload: payload[n : n+payloadLen]})
 		n += payloadLen
 	}
 
-	if len(e.payload) == 0 && !bytes.HasPrefix(buf, []byte{0x10, 0x00, 0x00, 0x00}) {
-		e.payload = []byte{0x10, 0x00, 0x00, 0x00}
+	return extensions
+}
+
+// marshalTwoByteExtensions serializes extensions as an RFC 8285 two-byte
+// header extension block. Extensions are packed tightly, zero padding is only
+// added at the tail to reach a 32-bit boundary, and the length field is kept
+// in sync with the actual payload.
+func marshalTwoByteExtensions(extensions []Extension) []byte {
+	payload := []byte{0x10, 0x00, 0x00, 0x00}
+	for _, extension := range extensions {
+		payload = append(payload, extension.id, uint8(len(extension.payload))) // nolint: gosec // G115
+		payload = append(payload, extension.payload...)
 	}
+	for len(payload)%4 != 0 {
+		payload = append(payload, 0x00)
+	}
+	binary.BigEndian.PutUint16(payload[2:4], uint16((len(payload)-4)/4)) // nolint: gosec // G115
 
-	e.payload = append(e.payload, id, uint8(len(buf))) // nolint: gosec // G115
-	e.payload = append(e.payload, buf...)
-	binary.BigEndian.PutUint16(e.payload[2:4], binary.BigEndian.Uint16(e.payload[2:4])+1)
-
-	return nil
+	return payload
 }
 
 // GetIDs returns the available IDs.
@@ -326,31 +378,13 @@ func (e *TwoByteHeaderExtension) Get(id uint8) []byte {
 
 // Del deletes the extension with the specified ID.
 func (e *TwoByteHeaderExtension) Del(id uint8) error {
-	for n := 4; n < len(e.payload); {
-		if e.payload[n] == 0x00 { // padding
-			n++
-
-			continue
-		}
-
-		extid := e.payload[n]
-
-		if n+1 >= len(e.payload) {
-			break
-		}
-
-		payloadLen := int(e.payload[n+1])
-
-		if n+2+payloadLen > len(e.payload) {
-			break
-		}
-
-		if extid == id {
-			e.payload = append(e.payload[:n], e.payload[n+2+payloadLen:]...)
+	extensions := parseTwoByteExtensions(e.payload)
+	for i := range extensions {
+		if extensions[i].id == id {
+			e.payload = marshalTwoByteExtensions(append(extensions[:i], extensions[i+1:]...))
 
 			return nil
 		}
-		n += payloadLen + 2
 	}
 
 	return errHeaderExtensionNotFound
@@ -481,7 +515,9 @@ func headerExtensionCheck(extensionProfile uint16, id uint8, payload []byte) err
 		if id < 1 || id > 14 {
 			return fmt.Errorf("%w actual(%d)", errRFC8285OneByteHeaderIDRange, id)
 		}
-		if len(payload) > 16 {
+		// The 4-bit length field stores len(payload)-1, so an empty payload
+		// cannot be represented with a one-byte header.
+		if len(payload) < 1 || len(payload) > 16 {
 			return fmt.Errorf("%w actual(%d)", errRFC8285OneByteHeaderSize, len(payload))
 		}
 	// RFC 8285 RTP Two Byte Header Extension

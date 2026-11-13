@@ -15,20 +15,20 @@ var (
 	errHeaderExtensionNotFound            = errors.New("extension not found")
 
 	errRFC8285OneByteHeaderIDRange = errors.New(
-		"header extension id must be between 1 and 14 for RFC 5285 one byte extensions",
+		"header extension id must be between 1 and 14 for RFC 8285 one byte extensions",
 	)
 	errRFC8285OneByteHeaderSize = errors.New(
-		"header extension payload must be 16bytes or less for RFC 5285 one byte extensions",
+		"header extension payload must be between 1 and 16 bytes for RFC 8285 one byte extensions",
 	)
 
 	errRFC8285TwoByteHeaderIDRange = errors.New(
-		"header extension id must be between 1 and 255 for RFC 5285 two byte extensions",
+		"header extension id must be between 1 and 255 for RFC 8285 two byte extensions",
 	)
 	errRFC8285TwoByteHeaderSize = errors.New(
-		"header extension payload must be 255bytes or less for RFC 5285 two byte extensions",
+		"header extension payload must be 255bytes or less for RFC 8285 two byte extensions",
 	)
 
-	errRFC3550HeaderIDRange = errors.New("header extension id must be 0 for non-RFC 5285 extensions")
+	errRFC3550HeaderIDRange = errors.New("header extension id must be 0 for non-RFC 8285 extensions")
 
 	errInvalidRTPPadding = errors.New("invalid RTP padding")
 )
