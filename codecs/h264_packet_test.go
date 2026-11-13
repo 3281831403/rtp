@@ -221,6 +221,153 @@ func TestH264IsPartitionHead(t *testing.T) {
 	assert.False(t, h264.IsPartitionHead(fubEndNalu), "fub end nalu must not be a partition head")
 }
 
+func TestH264IsPartitionTail(t *testing.T) {
+	h264 := H264Packet{}
+
+	assert.False(t, h264.IsPartitionTail(true, nil), "nil must not be a partition tail")
+	assert.False(t, h264.IsPartitionTail(true, []byte{}), "empty nalu must not be a partition tail")
+
+	singleNalu := []byte{1, 0}
+	assert.False(t, h264.IsPartitionTail(false, singleNalu), "single nalu without marker must not be a partition tail")
+	assert.True(t, h264.IsPartitionTail(true, singleNalu), "single nalu with marker must be a partition tail")
+
+	fuaStartNalu := []byte{fuaNALUType, fuStartBitmask}
+	assert.False(t, h264.IsPartitionTail(false, fuaStartNalu), "fua start nalu must not be a partition tail")
+	assert.False(t, h264.IsPartitionTail(true, fuaStartNalu), "fua start nalu must not be a partition tail even with marker")
+
+	fuaEndNalu := []byte{fuaNALUType, fuEndBitmask}
+	assert.True(t, h264.IsPartitionTail(false, fuaEndNalu), "fua end nalu must be a partition tail without marker")
+	assert.True(t, h264.IsPartitionTail(true, fuaEndNalu), "fua end nalu must be a partition tail with marker")
+
+	fubEndNalu := []byte{fubNALUType, fuEndBitmask}
+	assert.True(t, h264.IsPartitionTail(false, fubEndNalu), "fub end nalu must be a partition tail without marker")
+}
+
+// h264FUFragments is a fixed FU-A fragment sequence for a single NAL unit.
+// The reassembled NAL unit is {0x65, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}.
+func h264FUFragments() [][]byte {
+	return [][]byte{
+		{fuaNALUType | naluRefIdcBitmask, fuStartBitmask | 0x05, 0x01, 0x02, 0x03},
+		{fuaNALUType | naluRefIdcBitmask, 0x05, 0x04, 0x05, 0x06},
+		{fuaNALUType | naluRefIdcBitmask, fuEndBitmask | 0x05, 0x07},
+	}
+}
+
+func TestH264Packet_Unmarshal_IncompleteFUA(t *testing.T) {
+	fragments := h264FUFragments()
+
+	// Annex B output of the whole NAL unit.
+	wholeNalu := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+	// AVC output of the whole NAL unit.
+	wholeNaluAVC := []byte{0x00, 0x00, 0x00, 0x08, 0x65, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
+
+	t.Run("losing the start fragment yields no media", func(t *testing.T) {
+		pkt := H264Packet{}
+
+		for _, fragment := range fragments[1:] {
+			res, err := pkt.Unmarshal(fragment)
+			assert.NoError(t, err)
+			assert.Empty(t, res, "a fragment without its start must not produce media")
+		}
+	})
+
+	t.Run("losing the start fragment does not corrupt the next NAL", func(t *testing.T) {
+		pkt := H264Packet{}
+
+		for _, fragment := range fragments[1:] {
+			_, err := pkt.Unmarshal(fragment)
+			assert.NoError(t, err)
+		}
+
+		// A complete NAL unit follows the lost fragments.
+		res, err := pkt.Unmarshal([]byte{stapaNALUType, 0x00, 0x02, 0x65, 0xAA})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("\x00\x00\x00\x01\x65\xAA"), res,
+			"stale fragments must not be prepended to the next NAL unit")
+	})
+
+	t.Run("a non-FU packet terminates an unfinished fragment", func(t *testing.T) {
+		pkt := H264Packet{}
+
+		_, err := pkt.Unmarshal(fragments[0])
+		assert.NoError(t, err)
+
+		// The remaining fragments are lost and the next NAL arrives whole.
+		res, err := pkt.Unmarshal([]byte{0x65, 0xAA})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("\x00\x00\x00\x01\x65\xAA"), res)
+
+		// A late end fragment belongs to the abandoned NAL and must not be
+		// emitted, nor must it carry the abandoned bytes.
+		for _, fragment := range fragments[1:] {
+			res, err = pkt.Unmarshal(fragment)
+			assert.NoError(t, err)
+			assert.Empty(t, res, "a fragment of an abandoned NAL must not produce media")
+		}
+	})
+
+	t.Run("the start of a new fragment discards the old fragments", func(t *testing.T) {
+		pkt := H264Packet{}
+
+		_, err := pkt.Unmarshal(fragments[0])
+		assert.NoError(t, err)
+
+		// A new fragmented NAL unit starts before the previous one ended.
+		res, err := pkt.Unmarshal(fragments[0])
+		assert.NoError(t, err)
+		assert.Empty(t, res)
+
+		res, err = pkt.Unmarshal(fragments[1])
+		assert.NoError(t, err)
+		assert.Empty(t, res)
+
+		res, err = pkt.Unmarshal(fragments[2])
+		assert.NoError(t, err)
+		assert.Equal(t, wholeNalu, res,
+			"only the fragments of the restarted NAL unit must be emitted")
+	})
+
+	t.Run("a complete FU-A sequence reassembles", func(t *testing.T) {
+		pkt := H264Packet{}
+
+		var res []byte
+		for i, fragment := range fragments {
+			out, err := pkt.Unmarshal(fragment)
+			assert.NoError(t, err)
+			if i < len(fragments)-1 {
+				assert.Empty(t, out)
+			}
+			res = append(res, out...)
+		}
+		assert.Equal(t, wholeNalu, res)
+	})
+
+	t.Run("a complete FU-A sequence reassembles as AVC", func(t *testing.T) {
+		pkt := H264Packet{IsAVC: true}
+
+		var res []byte
+		for _, fragment := range fragments {
+			out, err := pkt.Unmarshal(fragment)
+			assert.NoError(t, err)
+			res = append(res, out...)
+		}
+		assert.Equal(t, wholeNaluAVC, res)
+	})
+}
+
+func TestH264Packet_Unmarshal_STAPA(t *testing.T) {
+	pkt := H264Packet{}
+
+	res, err := pkt.Unmarshal([]byte{
+		stapaNALUType, 0x00, 0x02, 0x65, 0xAA, 0x00, 0x03, 0x41, 0xBB, 0xCC,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0x00, 0x00, 0x00, 0x01, 0x65, 0xAA,
+		0x00, 0x00, 0x00, 0x01, 0x41, 0xBB, 0xCC,
+	}, res)
+}
+
 func TestH264Payloader_Payload_SPS_and_PPS_handling(t *testing.T) {
 	pck := H264Payloader{}
 	expected := [][]byte{

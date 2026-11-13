@@ -214,6 +214,9 @@ func (p *H264Payloader) Payload(mtu uint16, payload []byte) [][]byte { //nolint:
 type H264Packet struct {
 	IsAVC     bool
 	fuaBuffer []byte
+	// fuaStarted reports whether fuaBuffer holds fragments whose start fragment
+	// was received. It is false when no fragmented NAL unit is in progress.
+	fuaStarted bool
 
 	videoDepacketizer
 }
@@ -255,6 +258,15 @@ func (p *H264Packet) parseBody(payload []byte) ([]byte, error) { //nolint:cyclop
 	// NALU Types
 	// https://tools.ietf.org/html/rfc6184#section-5.4
 	naluType := payload[0] & naluTypeBitmask
+
+	// A packet that is not a FU-A fragment terminates any unfinished
+	// fragmented NAL unit. Without this, stale bytes from an incomplete NAL
+	// unit could be combined with bytes of a later one.
+	if naluType != fuaNALUType {
+		p.fuaBuffer = nil
+		p.fuaStarted = false
+	}
+
 	switch {
 	case naluType > 0 && naluType < 24:
 		return p.doPackaging(nil, payload), nil
@@ -290,24 +302,35 @@ func (p *H264Packet) parseBody(payload []byte) ([]byte, error) { //nolint:cyclop
 			return nil, errShortPacket
 		}
 
-		if p.fuaBuffer == nil {
-			p.fuaBuffer = []byte{}
+		// The start of a new fragmented NAL unit discards any fragments left
+		// over from a NAL unit whose remaining fragments were lost.
+		if payload[1]&fuStartBitmask != 0 {
+			p.fuaBuffer = p.fuaBuffer[:0]
+			p.fuaStarted = true
+		}
+
+		// A fragment without a start is undecodable: the NAL unit header and
+		// the leading bytes are missing. Drop it instead of mixing it into
+		// another NAL unit or handing a fragment to the decoder as a whole one.
+		if !p.fuaStarted {
+			return []byte{}, nil
 		}
 
 		p.fuaBuffer = append(p.fuaBuffer, payload[fuaHeaderSize:]...)
 
-		if payload[1]&fuEndBitmask != 0 {
-			naluRefIdc := payload[0] & naluRefIdcBitmask
-			fragmentedNaluType := payload[1] & naluTypeBitmask
-
-			nalu := append([]byte{}, naluRefIdc|fragmentedNaluType)
-			nalu = append(nalu, p.fuaBuffer...)
-			p.fuaBuffer = nil
-
-			return p.doPackaging(nil, nalu), nil
+		if payload[1]&fuEndBitmask == 0 {
+			return []byte{}, nil
 		}
 
-		return []byte{}, nil
+		naluRefIdc := payload[0] & naluRefIdcBitmask
+		fragmentedNaluType := payload[1] & naluTypeBitmask
+
+		nalu := append([]byte{}, naluRefIdc|fragmentedNaluType)
+		nalu = append(nalu, p.fuaBuffer...)
+		p.fuaBuffer = nil
+		p.fuaStarted = false
+
+		return p.doPackaging(nil, nalu), nil
 	}
 
 	return nil, fmt.Errorf("%w: %d", errUnhandledNALUType, naluType)
@@ -337,4 +360,26 @@ func (*H264Packet) IsPartitionHead(payload []byte) bool {
 	}
 
 	return true
+}
+
+// IsPartitionTail checks if this is the tail of a packetized nalu stream.
+//
+// A fragmented NAL unit ends with the fragment that has the FU end bit set,
+// which is independent of the RTP marker bit. Any other payload type is only
+// known to end its partition when the marker bit is set.
+func (*H264Packet) IsPartitionTail(marker bool, payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+
+	if len(payload) < 2 {
+		return marker
+	}
+
+	if payload[0]&naluTypeBitmask == fuaNALUType ||
+		payload[0]&naluTypeBitmask == fubNALUType {
+		return payload[1]&fuEndBitmask != 0
+	}
+
+	return marker
 }
