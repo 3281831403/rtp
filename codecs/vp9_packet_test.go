@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestVP9Packet_Unmarshal(t *testing.T) {
@@ -114,6 +115,18 @@ func TestVP9Packet_Unmarshal(t *testing.T) {
 				Payload:   []byte{},
 			},
 		},
+		"FlexiblePictureIDThreeRefIndices": {
+			// P_DIFF 1 (N=1), P_DIFF 2 (N=1), P_DIFF 1 (N=0).
+			b: []byte{0xD0, 0x02, 0x03, 0x05, 0x02, 0xAA},
+			pkt: VP9Packet{
+				I:         true,
+				P:         true,
+				F:         true,
+				PictureID: 0x02,
+				PDiff:     []uint8{0x01, 0x02, 0x01},
+				Payload:   []byte{0xAA},
+			},
+		},
 		"FlexiblePictureIDRefIndex_ShortPacket0": {
 			b:   []byte{0xD0, 0x02, 0x03},
 			err: errShortPacket,
@@ -165,7 +178,7 @@ func TestVP9Packet_Unmarshal(t *testing.T) {
 				NG:      2,
 				PGTID:   []uint8{0, 2},
 				PGU:     []bool{true, false},
-				PGPDiff: [][]uint8{{}, {33}},
+				PGPDiff: [][]uint8{nil, {33}},
 				Payload: []byte{},
 			},
 		},
@@ -203,6 +216,19 @@ func TestVP9Packet_Unmarshal(t *testing.T) {
 		"ScalabilityMissingReferenceIndices": {
 			b:   []byte("20H007"),
 			err: errShortPacket,
+		},
+		"ScalabilityStructureTooManySpatialLayers": {
+			// N_S = 7 declares 8 spatial layers, above the VP9 limit of 5.
+			b: []byte{
+				0x0A,
+				(7 << 5),
+			},
+			err: errTooManySpatialLayers,
+		},
+		"LayerInfoTooManySpatialLayers": {
+			// SID = 5 is outside the supported 0..4 spatial layer range.
+			b:   []byte{0xA0, 0x02, 0x0A, 0x01, 0xAA},
+			err: errTooManySpatialLayers,
 		},
 	}
 	for name, testCase := range cases {
@@ -270,6 +296,69 @@ func TestVP9Packet_Unmarshal_ReusedPacketDoesNotAllocate(t *testing.T) {
 		assert.NoError(t, err)
 	})
 	assert.Zero(t, allocs)
+}
+
+// Flexible-mode descriptor with I,P,F set (L clear) carrying three reference
+// indices and no payload. The 7-bit Picture ID is 1 (high bit clear); each
+// index byte is P_DIFF<<1 with the N continuation bit in bit 0: P_DIFF 1
+// (N=1), P_DIFF 2 (N=1), P_DIFF 1 (N=0).
+//
+//nolint:gochecknoglobals
+var vp9FlexibleRefs = []byte{0xD0, 0x01, (1 << 1) | 1, (2 << 1) | 1, 1 << 1}
+
+// A reused packet must not keep reference indices (or any other field) from a
+// previously parsed descriptor: parsing a second packet yields the same result
+// as parsing it into a zero-value packet.
+func TestVP9Packet_Unmarshal_ReusedPacketDoesNotAccumulate(t *testing.T) {
+	reused := VP9Packet{}
+	_, err := reused.Unmarshal(vp9FlexibleRefs)
+	assert.NoError(t, err)
+	assert.Equal(t, []uint8{1, 2, 1}, reused.PDiff)
+
+	// Parse a packet without reference indices into the same instance.
+	noRefs := []byte{0x80, 0x02, 0xAA}
+	_, err = reused.Unmarshal(noRefs)
+	assert.NoError(t, err)
+
+	fresh := VP9Packet{}
+	_, err = fresh.Unmarshal(noRefs)
+	assert.NoError(t, err)
+
+	assert.Equal(t, fresh, reused)
+	assert.Empty(t, reused.PDiff, "reference indices from the previous packet must be dropped")
+}
+
+// Repeatedly parsing the largest descriptor through a reused packet must not
+// allocate, including its reference indices and picture-group slices.
+func TestVP9Packet_Unmarshal_ReusedRefsDoesNotAllocate(t *testing.T) {
+	p := VP9Packet{}
+	allocs := testing.AllocsPerRun(100, func() {
+		_, err := p.Unmarshal(vp9FlexibleRefs)
+		assert.NoError(t, err)
+	})
+	assert.Zero(t, allocs)
+	assert.Len(t, p.PDiff, 3)
+}
+
+// Cycling two different descriptors through one instance must match a fresh
+// parse of each on every iteration, regardless of parse order.
+func TestVP9Packet_Unmarshal_ReusedPacketStableAcrossDescriptors(t *testing.T) {
+	reused := VP9Packet{}
+	for range 10 {
+		freshRefs := VP9Packet{}
+		_, err := freshRefs.Unmarshal(vp9FlexibleRefs)
+		assert.NoError(t, err)
+		_, err = reused.Unmarshal(vp9FlexibleRefs)
+		assert.NoError(t, err)
+		assert.Equal(t, freshRefs, reused)
+
+		freshSS := VP9Packet{}
+		_, err = freshSS.Unmarshal(vp9SS3Layers)
+		assert.NoError(t, err)
+		_, err = reused.Unmarshal(vp9SS3Layers)
+		assert.NoError(t, err)
+		assert.Equal(t, freshSS, reused)
+	}
 }
 
 func TestVP9Payloader_Payload(t *testing.T) {
@@ -398,6 +487,22 @@ func TestVP9Payloader_Payload(t *testing.T) {
 				0x31, 0x42, 0x8c, 0xc0, 0x40,
 			}},
 		},
+		"non-flexible show existing frame": {
+			// A show_existing_frame only displays a stored reference frame; it
+			// is inter-picture predicted and must not carry a scalability
+			// structure, so it keeps the 3-byte header of a non-key frame.
+			b: [][]byte{{
+				0b10101010, 0x49, 0x83, 0x42, 0x40, 0xef, 0xf0, 0x86,
+				0xf4, 0x04, 0x21, 0xa0, 0xe0, 0x00, 0x30, 0x70,
+				0x00, 0x00, 0x00, 0x01,
+			}},
+			mtu: 100,
+			res: [][]byte{{
+				0xcd, 0xa1, 0xf4, 0xaa, 0x49, 0x83, 0x42, 0x40,
+				0xef, 0xf0, 0x86, 0xf4, 0x04, 0x21, 0xa0, 0xe0,
+				0x00, 0x30, 0x70, 0x00, 0x00, 0x00, 0x01,
+			}},
+		},
 	}
 
 	for name, testCase := range cases {
@@ -445,6 +550,64 @@ func TestVP9Payloader_Payload(t *testing.T) {
 			pPrev = packet
 		}
 	})
+}
+
+// A call that cannot emit a single packet (MTU too small, empty input) must
+// not consume a Picture ID: the next real packet keeps the same ID so
+// receivers never observe a gap for a picture that was never sent.
+func TestVP9Payloader_EmptyCallDoesNotConsumePictureID(t *testing.T) {
+	const initialID uint16 = 100
+	keyFrame := []byte{0x82, 0x49, 0x83, 0x42, 0x0, 0x77, 0xf0, 0x32, 0x34}
+
+	for _, flexible := range []bool{true, false} {
+		pck := VP9Payloader{
+			FlexibleMode:       flexible,
+			InitialPictureIDFn: func() uint16 { return initialID },
+		}
+
+		assert.Empty(t, pck.Payload(1, keyFrame), "MTU below header size must produce no packets")
+		assert.Empty(t, pck.Payload(100, nil), "empty input must produce no packets")
+
+		packets := pck.Payload(20, keyFrame)
+		require.Len(t, packets, 1)
+		packet := VP9Packet{}
+		_, err := packet.Unmarshal(packets[0])
+		assert.NoError(t, err)
+		assert.Equal(t, initialID, packet.PictureID, "Picture ID must not advance for calls that emitted nothing")
+	}
+}
+
+// Every emitted packet must fit the MTU, including the key-frame first
+// fragment whose 11-byte header carries the scalability structure.
+func TestVP9Payloader_PacketsDoNotExceedMTU(t *testing.T) {
+	frames := map[string][]byte{
+		"key frame": {
+			0x82, 0x49, 0x83, 0x42, 0x00, 0x77, 0xf0, 0x32,
+			0x34, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a,
+		},
+		"show existing frame": {
+			0b10101010, 0x49, 0x83, 0x42, 0x40, 0xef, 0xf0, 0x86,
+			0xf4, 0x04, 0x21, 0xa0, 0xe0, 0x00, 0x30, 0x70,
+			0x00, 0x00, 0x00, 0x01,
+		},
+	}
+
+	for _, flexible := range []bool{true, false} {
+		for name, frame := range frames {
+			pck := VP9Payloader{
+				FlexibleMode:       flexible,
+				InitialPictureIDFn: func() uint16 { return 1 },
+			}
+			for _, mtu := range []uint16{11, 12, 13, 20, 100, 1200} {
+				packets := pck.Payload(mtu, frame)
+				for i, pkt := range packets {
+					assert.LessOrEqualf(t, len(pkt), int(mtu),
+						"%s (flexible=%v) packet %d exceeds MTU %d", name, flexible, i, mtu)
+				}
+			}
+		}
+	}
 }
 
 func TestVP9IsPartitionHead(t *testing.T) {

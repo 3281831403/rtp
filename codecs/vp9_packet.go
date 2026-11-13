@@ -47,6 +47,14 @@ func (p *VP9Payloader) Payload(mtu uint16, payload []byte) [][]byte {
 		payloads = p.payloadNonFlexible(mtu, payload)
 	}
 
+	// A call that produced no packets does not represent a picture on the
+	// wire, so it must not consume a Picture ID: receivers track gaps by the
+	// IDs they actually observe, and burning an ID here makes them request a
+	// refresh for a frame that was never sent.
+	if len(payloads) == 0 {
+		return payloads
+	}
+
 	p.pictureID++
 	if p.pictureID >= 0x8000 {
 		p.pictureID = 0
@@ -136,13 +144,20 @@ func (p *VP9Payloader) payloadNonFlexible(mtu uint16, payload []byte) [][]byte {
 		return [][]byte{}
 	}
 
+	// A show_existing_frame does not decode a new picture: it merely displays a
+	// reference frame already held by the decoder. It therefore cannot carry a
+	// scalability structure (which describes a stream's spatial layers) and is
+	// treated as an inter-picture predicted frame, matching RFC 9628's rule
+	// that the SS only travels in the first packet of a key picture.
+	isKeyFrame := !header.NonKeyFrame && !header.ShowExistingFrame
+
 	payloadDataRemaining := len(payload)
 	payloadDataIndex := 0
 	var payloads [][]byte
 
 	for payloadDataRemaining > 0 {
 		var headerSize int
-		if !header.NonKeyFrame && payloadDataIndex == 0 {
+		if isKeyFrame && payloadDataIndex == 0 {
 			headerSize = 3 + 8
 		} else {
 			headerSize = 3
@@ -158,7 +173,7 @@ func (p *VP9Payloader) payloadNonFlexible(mtu uint16, payload []byte) [][]byte {
 
 		out[0] = 0x80 | 0x01 // I=1, Z=1
 
-		if header.NonKeyFrame {
+		if !isKeyFrame {
 			out[0] |= 0x40 // P=1
 		}
 		if payloadDataIndex == 0 {
@@ -172,7 +187,7 @@ func (p *VP9Payloader) payloadNonFlexible(mtu uint16, payload []byte) [][]byte {
 		out[2] = byte(p.pictureID) //nolint:gosec
 		off := 3
 
-		if !header.NonKeyFrame && payloadDataIndex == 0 {
+		if isKeyFrame && payloadDataIndex == 0 {
 			out[0] |= 0x02         // V=1
 			out[off] = 0x10 | 0x08 // N_S=0, Y=1, G=1
 			off++
@@ -258,6 +273,38 @@ func (p *VP9Packet) Unmarshal(packet []byte) ([]byte, error) { // nolint:cyclop
 		return nil, errShortPacket
 	}
 
+	// Reset every parsed field before parsing so a reused packet yields exactly
+	// what a fresh, zero-value packet would. Optional slices are truncated to
+	// length zero while keeping their backing arrays (a nil slice stays nil),
+	// and the parse helpers keep them nil until they actually hold an element.
+	// Together this gives identical results to a fresh parse with no steady
+	// state allocations once the largest descriptor has been seen.
+	p.I = false
+	p.P = false
+	p.L = false
+	p.F = false
+	p.B = false
+	p.E = false
+	p.V = false
+	p.Z = false
+	p.PictureID = 0
+	p.TID = 0
+	p.U = false
+	p.SID = 0
+	p.D = false
+	p.PDiff = p.PDiff[:0]
+	p.TL0PICIDX = 0
+	p.NS = 0
+	p.Y = false
+	p.G = false
+	p.NG = 0
+	p.Width = p.Width[:0]
+	p.Height = p.Height[:0]
+	p.PGTID = p.PGTID[:0]
+	p.PGU = p.PGU[:0]
+	p.PGPDiff = p.PGPDiff[:0]
+	p.Payload = nil
+
 	p.I = packet[0]&0x80 != 0
 	p.P = packet[0]&0x40 != 0
 	p.L = packet[0]&0x20 != 0
@@ -296,6 +343,30 @@ func (p *VP9Packet) Unmarshal(packet []byte) ([]byte, error) { // nolint:cyclop
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Normalize every empty optional slice to nil. The reset above truncates
+	// previously allocated slices to length zero to retain their capacity, but
+	// a zero-value packet keeps absent fields nil; folding empty slices back to
+	// nil makes a reused packet identical to a fresh one without dropping the
+	// backing arrays of fields that do hold elements.
+	if len(p.PDiff) == 0 {
+		p.PDiff = nil
+	}
+	if len(p.Width) == 0 {
+		p.Width = nil
+	}
+	if len(p.Height) == 0 {
+		p.Height = nil
+	}
+	if len(p.PGTID) == 0 {
+		p.PGTID = nil
+	}
+	if len(p.PGU) == 0 {
+		p.PGU = nil
+	}
+	if len(p.PGPDiff) == 0 {
+		p.PGPDiff = nil
 	}
 
 	p.Payload = packet[pos:]
@@ -403,18 +474,18 @@ func (p *VP9Packet) parseRefIndices(packet []byte, pos int) (int, error) {
 		if len(packet) <= pos {
 			return pos, errShortPacket
 		}
-		p.PDiff = append(p.PDiff, packet[pos]>>1)
-		if packet[pos]&0x01 == 0 {
-			break
-		}
 		if len(p.PDiff) >= maxVP9RefPics {
 			return pos, errTooManyPDiff
 		}
-		pos++
-	}
-	pos++
 
-	return pos, nil
+		more := packet[pos]&0x01 != 0
+		p.PDiff = appendPreserveNil(p.PDiff, packet[pos]>>1)
+		pos++
+
+		if !more {
+			return pos, nil
+		}
+	}
 }
 
 // Scalability structure (SS):
@@ -448,6 +519,14 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 	p.G = packet[pos]&0x8 != 0
 	pos++
 
+	// N_S + 1 is the number of spatial layers declared by the stream. VP9
+	// implementations cannot express more than maxSpatialLayers, so a larger
+	// value makes the descriptor invalid rather than silently inflating the
+	// parsed layer count.
+	if p.NS >= maxSpatialLayers {
+		return pos, errTooManySpatialLayers
+	}
+
 	NS := p.NS + 1
 	p.NG = 0
 
@@ -480,13 +559,13 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 			return pos, errShortPacket
 		}
 
-		p.PGTID = append(p.PGTID, packet[pos]>>5)
-		p.PGU = append(p.PGU, packet[pos]&0x10 != 0)
+		p.PGTID = appendPreserveNil(p.PGTID, packet[pos]>>5)
+		p.PGU = appendPreserveNil(p.PGU, packet[pos]&0x10 != 0)
 		reference := int((packet[pos] >> 2) & 0x3)
 		pos++
 
 		if i >= cap(p.PGPDiff) {
-			p.PGPDiff = append(p.PGPDiff, []uint8{})
+			p.PGPDiff = appendPreserveNil(p.PGPDiff, []uint8(nil))
 		} else {
 			p.PGPDiff = p.PGPDiff[:i+1]
 			p.PGPDiff[i] = p.PGPDiff[i][:0]
@@ -497,7 +576,7 @@ func (p *VP9Packet) parseSSData(packet []byte, pos int) (int, error) { // nolint
 		}
 
 		for range reference {
-			p.PGPDiff[i] = append(p.PGPDiff[i], packet[pos])
+			p.PGPDiff[i] = appendPreserveNil(p.PGPDiff[i], packet[pos])
 			pos++
 		}
 	}
